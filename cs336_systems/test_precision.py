@@ -4,7 +4,7 @@ from cs336_systems.fa2_triton import FlashAttention2
 from cs336_systems.fa2_torch import FlashAttention2_torch
 from cs336_systems.fa2_naive import MyAttention
 
-torch.set_float32_matmul_precision("high")
+torch.set_float32_matmul_precision("medium")
 
 
 def test_precision_with_npz(filename, atol=1e-4,rtol=1e-4):
@@ -91,7 +91,7 @@ if __name__ == "__main__":
     files = ["/data/nlp_course/2-fa2-data/fa2_nheads16_seq4128_dhead64.npz", "/data/nlp_course/2-fa2-data/fa2_nheads32_seq8576_dhead128.npz"]#,]#
     
     # Test against ground truth with different tolerance levels
-    for atol,rtol in [(1e-3, 1e-3)]:
+    for atol,rtol in [(1e-3, 0)]:
         print(f"\n{'#'*80}")
         print(f"Testing with atol={atol}, rtol={rtol}")
         print(f"{'#'*80}")

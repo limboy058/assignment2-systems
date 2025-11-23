@@ -174,6 +174,7 @@ def flash_attention_backward_compiled(Q, K, V, O, L, dO, scale, is_causal=False)
         S = S.masked_fill(causal_mask, float('-inf'))
 
     P = torch.exp(S - L.unsqueeze(-1))  
+    #P = torch.softmax(S, dim=-1)
     dV = torch.matmul(P.transpose(-2, -1), dO)  
     dP = torch.matmul(dO, V.transpose(-2, -1))  
 
