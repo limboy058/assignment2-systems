@@ -26,3 +26,5 @@ def clip_gradient(parameters, max_norm):
     clip_coef = min(1, max_norm / (norm + 1e-6))
     for g in grads:
         g *= clip_coef
+
+    return float(norm.item())

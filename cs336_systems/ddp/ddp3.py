@@ -116,14 +116,12 @@ def run_validation_multi_step(
     world_size: int,
     total_valid_seqs: int = 256,
     val_micro_batch_per_rank: int = 2,
-) -> float:
+) -> tuple[float, tuple[int, int]]:
     """
-    所有 rank 上做 validation
-    - 每个 rank 使用 val_micro_batch_per_rank 的 batch_size
-    - 每个 rank 处理 total_valid_seqs / world_size 个seq
-    - 最终用 all_reduce 聚合成全局平均 loss
+    返回:
+        global_avg_loss: 全局平均 val loss
+        val_shape: (total_valid_seqs, seq_len)
     """
-
     assert total_valid_seqs % world_size == 0, "total_valid_seqs 必须能被 world_size 整除"
     per_rank_valid_seqs = total_valid_seqs // world_size
 
@@ -161,7 +159,9 @@ def run_validation_multi_step(
     dist.all_reduce(count_tensor, op=dist.ReduceOp.SUM)
 
     global_avg_loss = (loss_tensor / count_tensor).item()
-    return global_avg_loss
+    # 总体上相当于 (total_valid_seqs, seq_len)
+    val_shape = (total_valid_seqs, cfg.seq_len)
+    return global_avg_loss, val_shape
 
 
 
@@ -341,7 +341,7 @@ def ddp_train_worker(rank: int, world_size: int, cfg: TrainConfig, args: argpars
 
     # 7. cosine lr 
     warmup_iters = min(1000, max(10, cfg.max_steps // 10))
-    cosine_cycle_iters = min(30000, cfg.max_steps)
+    cosine_cycle_iters = min(25000, cfg.max_steps)
     max_lr = cfg.lr
     min_lr = cfg.min_lr
 
@@ -355,10 +355,13 @@ def ddp_train_worker(rank: int, world_size: int, cfg: TrainConfig, args: argpars
     ckpt_dir = "/mnt/mnt/zjdx/tyhcyq"
     os.makedirs(ckpt_dir, exist_ok=True)
 
+    # 训练开始的 wall-clock，用作“背景时间”
+    train_start_t = time.time()
+
     for step in range(cfg.max_steps):
         step_train_t0 = time.time()
 
-        # 手动设置lr
+        # 手动设置 lr
         lr = get_cosine_lr(
             it=step,
             max_learning_rate=max_lr,
@@ -385,7 +388,10 @@ def ddp_train_worker(rank: int, world_size: int, cfg: TrainConfig, args: argpars
 
         loss.backward()
         ddp_model.finish_gradient_synchronization()
-        clip_gradient(ddp_model.parameters(), max_norm=1.0)
+
+        # 记录 grad_norm（clip 前后，看你 nn_utils.clip_gradient 返回的是哪一个）
+        grad_norm = clip_gradient(ddp_model.parameters(), max_norm=1.0)
+
         optimizer.step()
 
         step_train_time = time.time() - step_train_t0
@@ -396,20 +402,28 @@ def ddp_train_worker(rank: int, world_size: int, cfg: TrainConfig, args: argpars
         need_log = (global_step % cfg.log_interval == 0 or global_step == 1)
 
         if need_log:
+            # ====== validation 时间 ======
             val_t0 = time.time()
-            val_loss = run_validation_multi_step(
+            val_loss, val_shape = run_validation_multi_step(
                 ddp_model=ddp_model,
                 cfg=cfg,
                 device_str=device_str,
                 valid_data=valid_data,
                 rank=rank,
                 world_size=world_size,
-                total_valid_seqs=256,        # 符合要求的valid_seqs=256
+                total_valid_seqs=256,        # 符合要求的 valid_seqs=256
                 val_micro_batch_per_rank=2,
             )
             val_time = time.time() - val_t0
 
             if rank == 0:
+                # 背景时间：从训练开始到现在的 wall-clock 秒数
+                wall_clock_s = time.time() - train_start_t
+                wall_clock_str = time.strftime(
+                    "%Y-%m-%d %H:%M:%S",
+                    time.localtime(time.time()),
+                )
+
                 # ===== wandb 时间 =====
                 wandb_time = 0.0
                 if wandb_run is not None:
@@ -419,11 +433,16 @@ def ddp_train_worker(rank: int, world_size: int, cfg: TrainConfig, args: argpars
                         iteration=global_step,
                         loss=loss.item(),
                         learning_rate=lr,
+                        grad_norm=grad_norm,
+                        train_step_time=step_train_time,
                     )
                     log_validation_metrics(
                         wandb_run,
                         iteration=global_step,
                         val_loss=val_loss,
+                        val_total_seqs=val_shape[0],
+                        val_seq_len=val_shape[1],
+                        val_step_time=val_time,
                     )
                     wandb_time = time.time() - t_w0
 
@@ -451,15 +470,22 @@ def ddp_train_worker(rank: int, world_size: int, cfg: TrainConfig, args: argpars
 
                 ckpt_time = time.time() - t_ckpt0
 
-                # ===== 打印平均时间（窗口内按 step 平均）=====
+                # ===== 打印平均 train_time（窗口内按 step 平均）=====
                 avg_train_time = train_time_accum / steps_in_window
 
+                # 第一个 log：背景时间 + loss + grad_norm + val shape
                 print(
                     f"[DDP-ind step {global_step:5d}] "
+                    f"time={wall_clock_str} "
+                    f"(since_start={wall_clock_s:.1f}s) "
                     f"lr={lr:.6e} "
                     f"train_loss={loss.item():.4f} "
                     f"val_loss={val_loss:.4f} "
+                    f"grad_norm={float(grad_norm):.4f} "
+                    f"val_shape={val_shape}"
                 )
+
+                # 第二个 log：各阶段耗时
                 print(
                     f"[DDP-ind step {global_step:5d}] "
                     f"avg_train_time={avg_train_time:.4f}s, "
@@ -468,8 +494,11 @@ def ddp_train_worker(rank: int, world_size: int, cfg: TrainConfig, args: argpars
                     f"ckpt_time={ckpt_time:.4f}s, "
                     f"new_best={is_new_best}"
                 )
+
+                # 重置窗口计时
                 train_time_accum = 0.0
                 steps_in_window = 0
+
 
 
 
