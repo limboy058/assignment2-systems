@@ -4,15 +4,6 @@ import triton.language as tl
 import math
 
 
-
-# @triton.autotune(
-#     configs=[
-#         triton.Config({'Q_TILE_SIZE': 16, 'K_TILE_SIZE': 16}, num_warps=4),
-#         triton.Config({'Q_TILE_SIZE': 32, 'K_TILE_SIZE': 32}, num_warps=4),
-#         triton.Config({'Q_TILE_SIZE': 64, 'K_TILE_SIZE': 64}, num_warps=8),
-#     ],
-#     key=['N_QUERIES', 'N_KEYS', 'D'],
-# )
 @triton.jit
 def flash_fwd_kernel(
     Q_ptr, K_ptr, V_ptr,
@@ -189,72 +180,149 @@ def flash_attention_backward_compiled(Q, K, V, O, L, dO, scale, is_causal=False)
     return dQ, dK, dV
 
 
-
 class FlashAttention2(torch.autograd.Function):
     @staticmethod
     def forward(ctx, Q, K, V, is_causal=False):
         """
         FA-2 in Triton.
 
-        PS: uv test接口的_make_attn_inputs函数传入参数是(batch_size, seq_len, head_dim),
-        但是评测的时候用(batch_size, heads, seq_len, head_dim), 实际上batch==1并且batch维度被消去了, 传入(heads, seq_len, head_dim), 
+        支持两种输入形状:
+        1) 3D: (batch, seq_len, head_dim)
+        2) 4D: (batch, n_heads, seq_len, head_dim)
 
-        batch_size和heads混用感觉并不是很严谨, 但为了适配test和评测接口, 我也先把heads当batch用了. 
-        这样无法处理多batch且多heads情况, 日后我再改吧.
-
-        Args:
-            Q: (batch_size/heads, seq_len_q, head_dim)
-            K: (batch_size/heads, seq_len_k, head_dim)
-            V: (batch_size/heads, seq_len_k, head_dim)
-            is_causal: bool
-        Returns:
-            O: (batch_size/heads, seq_len_q, head_dim)
+        内部会把 (batch, n_heads, seq, d) 摊平成
+        (batch * n_heads, seq, d) 送进 Triton kernel.
         """
-        batch_size, seq_len_q, head_dim = Q.shape
-        _, seq_len_k, _ = K.shape
-        
-        #如果设置为64无法通过1e-3评测.(max diff =  1.432449e-03)
+        ndim = Q.dim()
+        if ndim == 3:
+            # Q, K, V: (B, S_q, D)
+            B, S_q, D = Q.shape
+            _, S_k, _ = K.shape
+
+            B_flat = B
+            Q_flat = Q
+            K_flat = K
+            V_flat = V
+        elif ndim == 4:
+            # Q, K, V: (B, H, S_q, D)
+            B, H, S_q, D = Q.shape
+            _, _, S_k, _ = K.shape
+
+            B_flat = B * H
+            # 统一展平为 (B*H, S, D)
+            Q_flat = Q.reshape(B_flat, S_q, D)
+            K_flat = K.reshape(B_flat, S_k, D)
+            V_flat = V.reshape(B_flat, S_k, D)
+        else:
+            raise ValueError(
+                f"FlashAttention2 only supports 3D or 4D inputs, got Q.dim()={ndim}"
+            )
+
+        # 如果设置为64无法通过1e-3评测.(max diff =  1.432449e-03)
         Q_TILE_SIZE = 32
         K_TILE_SIZE = 32
-        
-        O = torch.zeros_like(Q)
-        L = torch.zeros(batch_size, seq_len_q, device=Q.device, dtype=Q.dtype)
-        
-        scale = 1.0 / math.sqrt(head_dim)
-        
-        num_query_tiles = triton.cdiv(seq_len_q, Q_TILE_SIZE)
-        
-        grid = (num_query_tiles, batch_size, )
-        
+
+        # 输出 & log-sum-exp 缓冲区都用展平后的 batch 维度
+        O_flat = torch.zeros_like(Q_flat)
+        L_flat = torch.zeros(
+            B_flat, S_q, device=Q.device, dtype=Q.dtype
+        )
+
+        scale = 1.0 / math.sqrt(D)
+
+        num_query_tiles = triton.cdiv(S_q, Q_TILE_SIZE)
+        grid = (num_query_tiles, B_flat)
+
         flash_fwd_kernel[grid](
-            Q, K, V,
-            O, L,
-            Q.stride(0), Q.stride(1), Q.stride(2),
-            K.stride(0), K.stride(1), K.stride(2),
-            V.stride(0), V.stride(1), V.stride(2),
-            O.stride(0), O.stride(1), O.stride(2),
-            L.stride(0), L.stride(1),
-            seq_len_q, seq_len_k,
+            Q_flat, K_flat, V_flat,
+            O_flat, L_flat,
+            Q_flat.stride(0), Q_flat.stride(1), Q_flat.stride(2),
+            K_flat.stride(0), K_flat.stride(1), K_flat.stride(2),
+            V_flat.stride(0), V_flat.stride(1), V_flat.stride(2),
+            O_flat.stride(0), O_flat.stride(1), O_flat.stride(2),
+            L_flat.stride(0), L_flat.stride(1),
+            S_q, S_k,
             scale,
             is_causal,
-            head_dim,
+            D,
             Q_TILE_SIZE,
             K_TILE_SIZE,
         )
-        
-        # Save for backward
-        ctx.save_for_backward(Q, K, V, O, L)
+
+        # 保存展平后的张量，方便 backward 直接复用
+        ctx.save_for_backward(Q_flat, K_flat, V_flat, O_flat, L_flat)
         ctx.is_causal = is_causal
         ctx.scale = scale
-        
+        ctx.orig_shape = Q.shape  # 用于把梯度 reshape 回去
+
+        # 对返回的输出做形状还原
+        if ndim == 3:
+            O = O_flat
+        else:
+            B, H, S_q, D = ctx.orig_shape
+            O = O_flat.reshape(B, H, S_q, D)
+
         return O
-    
+
     @staticmethod
     def backward(ctx, grad_out):
-        Q, K, V, O, L = ctx.saved_tensors
+        """
+        grad_out 也支持:
+        - 3D: (B, S_q, D)
+        - 4D: (B, H, S_q, D)
+        内部统一展平成 (B*H, S_q, D) 之后调用 bwd.
+        """
+        Q_flat, K_flat, V_flat, O_flat, L_flat = ctx.saved_tensors
         is_causal = ctx.is_causal
         scale = ctx.scale
-        dQ, dK, dV = flash_attention_backward_compiled(
-            Q, K, V, O, L, grad_out, scale, is_causal
+        orig_shape = ctx.orig_shape
+
+        ndim = grad_out.dim()
+        if ndim == 3:
+            # grad_out: (B, S_q, D)，已经是展平形态
+            dO_flat = grad_out
+            reshape_info = None
+        elif ndim == 4:
+            # grad_out: (B, H, S_q, D) -> (B*H, S_q, D)
+            B, H, S_q, D = grad_out.shape
+            dO_flat = grad_out.reshape(B * H, S_q, D)
+            reshape_info = (B, H)
+        else:
+            raise ValueError(
+                f"FlashAttention2 backward only supports 3D or 4D grad_out, got dim={ndim}"
+            )
+
+        # 这里的 flash_attention_backward_compiled 仍然按 (batch_like, S_q, D) 工作，
+        # 它只看到展平后的 batch 维度，不需要知道 heads 的存在
+        dQ_flat, dK_flat, dV_flat = flash_attention_backward_compiled(
+            Q_flat, K_flat, V_flat, O_flat, L_flat, dO_flat, scale, is_causal
         )
+
+        if reshape_info is None:
+            # 3D 情况，直接返回
+            dQ = dQ_flat
+            dK = dK_flat
+            dV = dV_flat
+        else:
+            # 4D 情况，把 (B*H, S, D) -> (B, H, S, D)
+            B, H = reshape_info
+            # Q 的原始 seq_len / head_dim 可以从 orig_shape 拿
+            _, _, S_q, D = orig_shape
+            S_k = K_flat.shape[1]
+
+            dQ = dQ_flat.reshape(B, H, S_q, D)
+            dK = dK_flat.reshape(B, H, S_k, D)
+            dV = dV_flat.reshape(B, H, S_k, D)
+
         return dQ, dK, dV, None
+    
+
+
+
+def flash_attention2(q, k, v, mask=None):
+    return FlashAttention2.apply(q, k, v, mask)
+
+flash_attention2_compiled = torch.compile(
+    flash_attention2,
+    fullgraph=True,
+)

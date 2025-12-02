@@ -1,0 +1,93 @@
+uv run python -m cs336_systems.ddp.minimal_ddp \
+  --world-size 4 \
+  --batch-size 128 \
+  --model-size small \
+  --seq-len 128 \
+  --max-steps 200 \
+  --vocab-size 40375 \
+  --data-dir /mnt/mnt/zjdx \
+  --use-fa2 True
+
+
+uv run python -m cs336_systems.ddp.ddp \
+  --world-size 4 \
+  --model-size xl \
+  --batch-size 128 \
+  --seq-len 128 \
+  --max-steps 100 \
+  --vocab-size 40375 \
+  --data-dir /mnt/mnt/zjdx \
+  --use-fa2 False
+
+uv run python -m cs336_systems.ddp.ddp1 \
+  --world-size 4 \
+  --model-size xl \
+  --batch-size 64 \
+  --seq-len 4096 \
+  --max-steps 100 \
+  --vocab-size 40375 \
+  --data-dir /mnt/mnt/zjdx \
+  --use-fa2
+
+uv run python -m cs336_systems.ddp.ddp1   --world-size 4   --model-size xl   --batch-size 4   --seq-len 4096   --max-steps 500   --vocab-size 40375   --data-dir /mnt/mnt/zjdx   --use-fa2  --log-interval 100
+
+
+uv run python -m cs336_systems.ddp.ddp1   --world-size 4   --model-size xl   --batch-size 4   --seq-len 4096   --max-steps 500   --vocab-size 40375   --data-dir /mnt/mnt/zjdx   --use-fa2  --log-interval 100  --use-bf16
+
+# 开启 wandb 日志
+uv run python -m cs336_systems.ddp.ddp2 \
+  --world-size 4 \
+  --model-size xl \
+  --batch-size 4 \
+  --seq-len 4096 \
+  --max-steps 500 \
+  --vocab-size 40375 \
+  --data-dir /mnt/mnt/zjdx \
+  --log-interval 1000 \
+  --use-fa2 \
+  --use-bf16 \
+  --use_wandb \
+  --wandb_project cs336 \
+  --wandb_entity limboy-east-china-normal-university \
+  --wandb_run_name "xl-ddp-individual-bf16-bs4"
+
+
+
+
+# batch-size 4 或者 8
+# 检查max-steps, 正式跑的时候可以设一个100000000000
+# 检查log-interval, 一个参考是 log-interval 1000,batch 4 大约每 10 分钟val一次 (batch 8可能有变化). 此时相当于train 4✕1000个seq后val 256个seq.
+# 检查wandb_run_name, 应该每次用新的
+
+uv run python -m cs336_systems.ddp.ddp3 \
+--world-size 4 \
+--model-size xl \
+--batch-size 8 \
+--seq-len 4096 \
+--max-steps 1000 \
+--vocab-size 40375 \
+--data-dir /mnt/mnt/zjdx \
+--log-interval 200 \
+--use-fa2 \
+--use-bf16 \
+--use_wandb \
+--wandb_project cs336 \
+--wandb_entity limboy-east-china-normal-university \
+--wandb_run_name "xl9"
+
+# official
+uv run python -m cs336_systems.ddp.ddp3 \
+--world-size 4 \
+--model-size xl \
+--batch-size 8 \
+--seq-len 4096 \
+--max-steps 100000000000 \
+--vocab-size 40375 \
+--data-dir /mnt/mnt/zjdx \
+--log-interval 1000 \
+--use-fa2 \
+--use-bf16 \
+--use_wandb \
+--wandb_project cs336 \
+--wandb_entity limboy-east-china-normal-university \
+--wandb_run_name "xl10"

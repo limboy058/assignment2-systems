@@ -12,7 +12,7 @@ import torch
 import torch.nn as nn
 from torch import Tensor
 from jaxtyping import Float, Bool, Int
-
+from cs336_systems.fa2.fa2_triton import flash_attention2_compiled 
 
 from .nn_utils import softmax
 
@@ -184,6 +184,7 @@ class BasicsTransformerLM(nn.Module):
         num_heads: int,
         d_ff: int,
         rope_theta: float,
+        use_fa2: bool = False,
     ):
         # Store the model configuration for serialization / deserialization
         self.config = {
@@ -193,6 +194,7 @@ class BasicsTransformerLM(nn.Module):
         self.vocab_size = vocab_size
         self.context_length = context_length
         self.d_model = d_model
+        self.use_fa2 = use_fa2
         self.token_embeddings = Embedding(vocab_size, d_model)
         d_head = d_model // num_heads
         self.positional_encoder = RotaryEmbedding(
@@ -207,6 +209,7 @@ class BasicsTransformerLM(nn.Module):
                     num_heads=num_heads,
                     d_ff=d_ff,
                     positional_encoder=self.positional_encoder,
+                    use_fa2=self.use_fa2,
                 )
                 for _ in range(num_layers)
             ]
@@ -354,12 +357,14 @@ class TransformerBlock(nn.Module):
         num_heads: int,
         d_ff: int,
         positional_encoder: RotaryEmbedding,
+        use_fa2: bool = False,
     ):
         super().__init__()
         self.attn = CausalMultiHeadSelfAttention(
             d_model=d_model,
             num_heads=num_heads,
             positional_encoder=positional_encoder,
+            use_fa2=use_fa2,
         )
         self.ffn = SwiGLU(d_model=d_model, d_ff=d_ff)
         self.ln1 = RMSNorm(d_model)
@@ -458,6 +463,7 @@ class CausalMultiHeadSelfAttention(nn.Module):
         d_model: int,
         num_heads: int,
         positional_encoder: RotaryEmbedding,
+        use_fa2: bool = False,
     ):
         super().__init__()
         assert d_model % num_heads == 0
@@ -466,7 +472,7 @@ class CausalMultiHeadSelfAttention(nn.Module):
 
         self.d_k = d_model // num_heads
         self.d_v = self.d_k
-
+        self.use_fa2 = use_fa2
         self.q_proj = Linear(self.d_model, self.num_heads * self.d_k)
         self.k_proj = Linear(self.d_model, self.num_heads * self.d_k)
         self.v_proj = Linear(self.d_model, self.num_heads * self.d_v)
@@ -506,14 +512,18 @@ class CausalMultiHeadSelfAttention(nn.Module):
         Q = self.positional_encoder(Q, token_positions)
         K = self.positional_encoder(K, token_positions)
 
-        # Construct causal mask
-        seq = torch.arange(sequence_length, device=x.device)
-        qi = einx.rearrange('query -> b... 1 query 1', seq, b=[1] * len(b))
-        kj = einx.rearrange('key   -> b... 1 1   key', seq, b=[1] * len(b))
-        causal_mask = qi >= kj  # (query, key)
-
         # Shape: (..., num_heads, sequence_length, d_k)
-        attn_output = scaled_dot_product_attention(K=K, Q=Q, V=V, mask=causal_mask)
+        if(self.use_fa2):
+            attn_output = flash_attention2_compiled(Q, K, V, True)
+            # print("debug: Using FlashAttention2")
+        else:
+            # Construct causal mask
+            # assert 0
+            seq = torch.arange(sequence_length, device=x.device)
+            qi = einx.rearrange('query -> b... 1 query 1', seq, b=[1] * len(b))
+            kj = einx.rearrange('key   -> b... 1 1   key', seq, b=[1] * len(b))
+            causal_mask = qi >= kj  # (query, key)
+            attn_output = scaled_dot_product_attention(Q, K, V, mask=causal_mask)
 
         # Concatenate the attention output from all heads.
         # (..., sequence_length, num_heads * d_v).

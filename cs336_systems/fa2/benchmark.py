@@ -1,8 +1,8 @@
 import torch
 import triton
-from cs336_systems.fa2_triton import FlashAttention2
-from cs336_systems.fa2_torch import FlashAttention2_torch
-from cs336_systems.fa2_naive import MyAttention
+from cs336_systems.fa2.fa2_triton import FlashAttention2
+from cs336_systems.fa2.fa2_torch import FlashAttention2_torch
+from cs336_systems.fa2.fa2_naive import MyAttention
 
 torch.set_float32_matmul_precision('medium')
 
